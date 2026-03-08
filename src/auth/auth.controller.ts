@@ -16,22 +16,13 @@ import {
   RegisterDto,
   RefreshTokenDto,
   AuthResponseDto,
+  type JwtUser,
 } from './dto/auth.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { PermissionsGuard } from './guards/permissions.guard';
 import { CurrentUser } from './decorators/user.decorator';
 import { Permissions } from './decorators/permissions.decorator';
 import { type TenantRequest } from '../common/middleware/tenant.middleware';
-
-// This interface matches what JwtStrategy returns
-export interface JwtUser {
-  id: string;
-  email: string;
-  name: string;
-  tenantId: string;
-  role: string;
-  permissions: string[];
-}
 
 @Controller('auth')
 export class AuthController {
