@@ -16,13 +16,13 @@ import {
   RegisterDto,
   RefreshTokenDto,
   AuthResponseDto,
-  type JwtUser,
 } from './dto/auth.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { PermissionsGuard } from './guards/permissions.guard';
 import { CurrentUser } from './decorators/user.decorator';
 import { Permissions } from './decorators/permissions.decorator';
 import { type TenantRequest } from '../common/middleware/tenant.middleware';
+import { type JwtUser } from './interfaces/auth.interface';
 
 @Controller('auth')
 export class AuthController {

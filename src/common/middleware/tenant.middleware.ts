@@ -1,4 +1,4 @@
-import { JwtUser } from '@/auth/dto/auth.dto';
+import { JwtUser } from '@/auth/interfaces/auth.interface';
 import { Injectable, NestMiddleware, ForbiddenException } from '@nestjs/common';
 import { Request, Response, NextFunction } from 'express';
 

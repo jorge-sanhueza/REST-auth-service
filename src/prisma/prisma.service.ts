@@ -35,7 +35,7 @@ export class PrismaService
 
     // 2. Pass the adapter to the parent PrismaClient constructor
     super({
-      adapter: new PrismaPg(poolInstance),
+      adapter: new PrismaPg(poolInstance as any),
       log:
         process.env.NODE_ENV === 'development'
           ? ['query', 'info', 'warn', 'error']

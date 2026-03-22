@@ -5,7 +5,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { JwtUser } from '../dto/auth.dto';
+import { JwtUser } from '../interfaces/auth.interface';
 
 @Injectable()
 export class PermissionsGuard implements CanActivate {

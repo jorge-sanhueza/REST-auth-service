@@ -8,14 +8,27 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisEventService } from '../events/redis-event.service';
+import { RateLimiterService } from './rate-limiter.service';
 import * as bcrypt from 'bcrypt';
-import { Prisma, User, Role } from '@prisma/client';
+import { User, Role } from '@prisma/client';
 import {
   LoginDto,
   RegisterDto,
   RefreshTokenDto,
   AuthResponseDto,
 } from './dto/auth.dto';
+import { JwtUser } from './interfaces/auth.interface';
+import { createHash } from 'crypto';
+
+/** Produces a SHA-256 hex digest of a refresh token for safe DB storage. */
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+/** Safely casts the Prisma Json permissions field to a typed string array. */
+function toPermissions(value: unknown): string[] {
+  return Array.isArray(value) ? (value as string[]) : [];
+}
 
 type UserWithRole = User & { role: Role };
 
@@ -27,21 +40,20 @@ interface AuthEventPayload {
   metadata?: Record<string, unknown>;
 }
 
+// Access tokens expire in 15 minutes — blacklist entries must outlive them.
+const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
   private readonly refreshSecret: string;
-  private readonly loginAttempts = new Map<
-    string,
-    { count: number; firstAttempt: Date }
-  >();
-  private readonly tokenBlacklist = new Set<string>();
 
   constructor(
-    private prisma: PrismaService,
-    private jwtService: JwtService,
-    private eventService: RedisEventService,
-    private configService: ConfigService,
+    private readonly prisma: PrismaService,
+    private readonly jwtService: JwtService,
+    private readonly eventService: RedisEventService,
+    private readonly configService: ConfigService,
+    private readonly rateLimiter: RateLimiterService,
   ) {
     this.refreshSecret =
       this.configService.getOrThrow<string>('REFRESH_SECRET');
@@ -54,8 +66,7 @@ export class AuthService {
     const { email, password, tenantId } = loginDto;
     const key = `${email}:${tenantId}`;
 
-    // Rate limiting
-    this.checkRateLimit(key);
+    await this.checkRateLimit(key);
 
     const user = await this.prisma.user.findFirst({
       where: { email, tenantId: tenantId ?? undefined, isActive: true },
@@ -69,17 +80,15 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Clear rate limiting on success
-    this.loginAttempts.delete(key);
+    await this.rateLimiter.resetLoginAttempts(key);
 
     const { accessToken, refreshToken } = this.generateTokens(user);
 
-    // Atomic update with session tracking
     await this.prisma.$transaction([
       this.prisma.user.update({
         where: { id: user.id },
         data: {
-          refreshToken,
+          refreshToken: hashToken(refreshToken),
           tokenExpiry: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
           lastLoginAt: new Date(),
         },
@@ -91,16 +100,12 @@ export class AuthService {
           tenantId: user.tenantId,
           action: 'LOGIN_SUCCESS',
           status: 'SUCCESS',
-          details: {
-            ip: metadata?.ip,
-            userAgent: metadata?.userAgent,
-            timestamp: new Date().toISOString(),
-          } as Prisma.InputJsonValue,
+          ipAddress: metadata?.ip,
+          userAgent: metadata?.userAgent,
         },
       }),
     ]);
 
-    // Emit success event
     await this.eventService.emit<AuthEventPayload>('auth.login.success', {
       userId: user.id,
       email: user.email,
@@ -117,10 +122,8 @@ export class AuthService {
   async register(registerDto: RegisterDto): Promise<AuthResponseDto> {
     const { email, name, password, rut, phone, tenantId, roleId } = registerDto;
 
-    // Validate password strength
     this.validatePasswordStrength(password);
 
-    // Check existing user
     const existingUser = await this.prisma.user.findFirst({
       where: { email, tenantId },
     });
@@ -129,47 +132,50 @@ export class AuthService {
       throw new BadRequestException('User already exists in this tenant');
     }
 
-    // Get default role if not provided
-    let finalRoleId = roleId;
-    if (!finalRoleId) {
-      const defaultRole = await this.prisma.role.findFirst({
-        where: { tenantId, name: 'User' },
-      });
+    const finalRole = roleId
+      ? await this.prisma.role.findFirst({ where: { id: roleId } })
+      : await this.prisma.role.findFirst({ where: { tenantId, name: 'User' } });
 
-      if (!defaultRole) {
-        throw new BadRequestException('No default role found for tenant');
-      }
-      finalRoleId = defaultRole.id;
+    if (!finalRole) {
+      throw new BadRequestException(
+        roleId
+          ? 'Provided roleId does not exist'
+          : 'No default role found for tenant',
+      );
     }
 
-    // Hash password and create user
     const passwordHash = await bcrypt.hash(password, 10);
+    const tokenExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email,
-        name,
-        passwordHash,
-        rut,
-        phone,
-        tenantId,
-        roleId: finalRoleId,
+    // Create the user first to get id, write refresh token in the same transaction.
+    // Both tokens are generated once from the same jti so the access token returned to the client is consistent.
+    const { user, accessToken, refreshToken } = await this.prisma.$transaction(
+      async (tx) => {
+        const created = await tx.user.create({
+          data: {
+            email,
+            name,
+            passwordHash,
+            rut,
+            phone,
+            tenantId,
+            roleId: finalRole.id,
+          },
+          include: { role: true },
+        });
+
+        const tokens = this.generateTokens(created);
+
+        const updated = await tx.user.update({
+          where: { id: created.id },
+          data: { refreshToken: hashToken(tokens.refreshToken), tokenExpiry },
+          include: { role: true },
+        });
+
+        return { user: updated, ...tokens };
       },
-      include: { role: true },
-    });
+    );
 
-    const { accessToken, refreshToken } = this.generateTokens(user);
-
-    // Update with refresh token
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        refreshToken,
-        tokenExpiry: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      },
-    });
-
-    // Emit event
     await this.eventService.emit('user.created', {
       userId: user.id,
       email: user.email,
@@ -189,15 +195,13 @@ export class AuthService {
     try {
       const payload = this.jwtService.verify<{ sub: string }>(
         dto.refreshToken,
-        {
-          secret: this.refreshSecret,
-        },
+        { secret: this.refreshSecret, algorithms: ['HS256'] },
       );
 
       const user = await this.prisma.user.findFirst({
         where: {
           id: payload.sub,
-          refreshToken: dto.refreshToken,
+          refreshToken: hashToken(dto.refreshToken),
           tokenExpiry: { gt: new Date() },
           isActive: true,
         },
@@ -213,14 +217,11 @@ export class AuthService {
     } catch {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
-  }
+  } //consider adding token rotation
 
   async logout(userId: string, token?: string): Promise<void> {
     if (token) {
-      // Blacklist the token
-      this.tokenBlacklist.add(token);
-      // Auto-expire after 15 minutes
-      setTimeout(() => this.tokenBlacklist.delete(token), 15 * 60 * 1000);
+      await this.rateLimiter.blacklistToken(token, ACCESS_TOKEN_TTL_SECONDS);
     }
 
     await this.prisma.user.update({
@@ -243,7 +244,7 @@ export class AuthService {
     await this.prisma.user.update({
       where: { id: userId },
       data: {
-        refreshToken: exceptToken || null,
+        refreshToken: exceptToken ? hashToken(exceptToken) : null,
         tokenExpiry: exceptToken
           ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
           : null,
@@ -257,11 +258,42 @@ export class AuthService {
     });
   }
 
-  isTokenBlacklisted(token: string): boolean {
-    return this.tokenBlacklist.has(token);
+  async isTokenBlacklisted(token: string): Promise<boolean> {
+    return this.rateLimiter.isTokenBlacklisted(token);
   }
 
-  private generateTokens(user: UserWithRole) {
+  async validateUser(userId: string): Promise<JwtUser | null> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId, isActive: true },
+        include: { role: true, tenant: true },
+      });
+
+      if (!user) {
+        this.logger.debug(
+          `User validation failed: User ${userId} not found or inactive`,
+        );
+        return null;
+      }
+
+      return {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        tenantId: user.tenantId,
+        role: user.role.name,
+        permissions: toPermissions(user.role.permissions),
+      };
+    } catch (error) {
+      this.logger.error(`Error validating user ${userId}:`, error);
+      return null;
+    }
+  }
+
+  private generateTokens(user: UserWithRole): {
+    accessToken: string;
+    refreshToken: string;
+  } {
     const payload = {
       sub: user.id,
       email: user.email,
@@ -280,19 +312,10 @@ export class AuthService {
     };
   }
 
-  private checkRateLimit(key: string): void {
-    const attempts = this.loginAttempts.get(key) || {
-      count: 0,
-      firstAttempt: new Date(),
-    };
-
-    // Reset after 15 minutes
-    if (Date.now() - attempts.firstAttempt.getTime() > 15 * 60 * 1000) {
-      attempts.count = 0;
-      attempts.firstAttempt = new Date();
-    }
-
-    if (attempts.count >= 5) {
+  private async checkRateLimit(key: string): Promise<void> {
+    try {
+      await this.rateLimiter.consumeLoginAttempt(key);
+    } catch {
       throw new UnauthorizedException(
         'Too many failed attempts. Try again later.',
       );
@@ -303,20 +326,14 @@ export class AuthService {
     key: string,
     user?: UserWithRole,
   ): Promise<void> {
-    const attempts = this.loginAttempts.get(key) || {
-      count: 0,
-      firstAttempt: new Date(),
-    };
-    attempts.count++;
-    this.loginAttempts.set(key, attempts);
-
+    // The next login attempt will consume another point.
+    // We only need to emit events here.
     if (user) {
       await this.eventService.emit<AuthEventPayload>('auth.login.failed', {
         userId: user.id,
         email: user.email,
         tenantId: user.tenantId,
         timestamp: new Date(),
-        metadata: { attemptCount: attempts.count },
       });
 
       await this.prisma.auditLog.create({
@@ -326,7 +343,6 @@ export class AuthService {
           tenantId: user.tenantId,
           action: 'LOGIN_FAILED',
           status: 'FAILURE',
-          details: { attemptCount: attempts.count } as Prisma.InputJsonValue,
         },
       });
     }
@@ -359,48 +375,6 @@ export class AuthService {
     }
   }
 
-  async validateUser(userId: string): Promise<{
-    id: string;
-    email: string;
-    name: string;
-    tenantId: string;
-    role: string;
-    permissions: string[];
-  } | null> {
-    try {
-      const user = await this.prisma.user.findUnique({
-        where: {
-          id: userId,
-          isActive: true,
-        },
-        include: {
-          role: true,
-          tenant: true,
-        },
-      });
-
-      if (!user) {
-        this.logger.debug(
-          `User validation failed: User ${userId} not found or inactive`,
-        );
-        return null;
-      }
-
-      // Return safe user object (no password hash, etc.)
-      return {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        tenantId: user.tenantId,
-        role: user.role.name,
-        permissions: user.role.permissions as string[],
-      };
-    } catch (error) {
-      this.logger.error(`Error validating user ${userId}:`, error);
-      return null;
-    }
-  }
-
   private mapToAuthResponse(
     user: UserWithRole,
     accessToken: string,
@@ -415,7 +389,7 @@ export class AuthService {
         name: user.name,
         tenantId: user.tenantId,
         role: user.role.name,
-        permissions: user.role.permissions as string[],
+        permissions: toPermissions(user.role.permissions),
       },
     };
   }

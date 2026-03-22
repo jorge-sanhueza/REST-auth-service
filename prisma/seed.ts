@@ -18,7 +18,7 @@ const pool = new Pool({
   max: 1, // Seed only needs one connection
 });
 
-const adapter = new PrismaPg(pool);
+const adapter = new PrismaPg(pool as any);
 const prisma = new PrismaClient({ adapter });
 
 async function main() {

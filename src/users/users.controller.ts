@@ -25,7 +25,7 @@ import {
   UserResponseDto,
   UserListResponseDto,
 } from './dto/create-user.dto';
-import { type JwtUser } from '@/auth/dto/auth.dto';
+import { type JwtUser } from '@/auth/interfaces/auth.interface';
 
 @Controller('users')
 @UseGuards(JwtAuthGuard)
@@ -33,7 +33,7 @@ export class UsersController {
   constructor(private readonly usersService: UsersService) {}
 
   @Post()
-  @UseGuards(PermissionsGuard)
+  @UseGuards(PermissionsGuard) //consider moving this to global at the top of the class since every method uses it
   @Permissions('users:create')
   @HttpCode(HttpStatus.CREATED)
   async create(
