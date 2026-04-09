@@ -29,3 +29,9 @@
 | GET    | `/auth/profile`       | Get current user             |
 | GET    | `/auth/tenant-info`   | Get tenant context           |
 | DELETE | `/auth/sessions`      | Revoke all sessions          |
+
+## See Also
+
+For a more comprehensive, enterprise-ready implementation of the same auth & multi-tenancy concepts, check out:
+
+**[auth-tenant-service](https://github.com/jorge-sanhueza/auth-tenant-service)** – A production-grade evolution of this pattern with extended capabilities.
